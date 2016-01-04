@@ -1,0 +1,718 @@
+///////////////////////////////////////////////////////////////////////////////
+//
+//  File           : tagline_driver.c
+//  Description    : This is the implementation of the driver interface
+//                   between the OS and the low-level hardware.
+//
+//  Author         : Charles Penunia
+//  Created        : 10 November 2015
+
+// Include Files
+#include <cmpsc311_log.h>
+#include <cmpsc311_util.h>
+
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+
+// Project Includes
+#include "raid_bus.h"
+#include "raid_network.h"
+#include "tagline_driver.h"
+#include "raid_cache.h"
+
+// Defines
+#define MAX_TRACKS		97
+#define NUM_DISKS		10
+
+#define STRCTURE_REQ		0xFF
+#define STRUCTURE_BLOCK_NUM	0xFF
+#define STRUCTURE_DISK_ID	0xFF
+#define STRUCTURE_UNUSED	0x7F
+#define STRUCTURE_STATUS	0x1
+#define STRUCTURE_BLOCK_ID	0xFFFFFFFF
+
+#define NUMBER_REQ_BITS		8
+#define NUMBER_BLOCK_NUM_BITS	8
+#define NUMBER_DISK_ID_BITS	8
+#define NUMBER_UNUSED_BITS	7
+#define NUMBER_STATUS_BIT	1
+#define NUMBER_BLOCK_ID_BITS	32
+
+#define MAX_BLOCKS_CACHE	50
+
+// Structure for an entry in the allocation table
+typedef struct {
+	TagLineNumber tagline;
+	TagLineBlockNumber taglineBlock;
+	int contiguous;
+	RAIDDiskID disk;
+	RAIDBlockID blockID;
+	RAIDDiskID diskCopy;
+	RAIDBlockID blockIDCopy;
+} tableinfo;
+
+// More typedefs
+typedef enum {
+	TRUE = 0,
+	FALSE = 1
+} flag;
+
+// Global variables
+int *maxBlockNumAllowed, hits, misses;
+tableinfo **raidtable;
+char *failureBuf;
+
+//
+// Functions
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : tagline_driver_init
+// Description  : Initialize the driver with a number of maximum lines to process
+//
+// Inputs       : maxlines - the maximum number of tag lines in the system
+// Outputs      : 0 if successful, -1 if failure
+
+int tagline_driver_init(uint32_t maxlines) {
+
+	// Declares local variables
+	RAIDOpCode response;
+	int i;
+	int arr[RAID_OPCODE_MAXVAL] = {0};
+
+	// Sets the random seed
+	srand((unsigned) time(NULL));
+
+	// Initializes RAID
+	response = create_raid_request
+		(RAID_INIT, MAX_TRACKS, NUM_DISKS, 0, 0, 0, NULL);
+
+	// Checks if the RAID command executed successfully
+	extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+	if (arr[RAID_OPCODE_STATUS] == 1) {
+		logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");	
+		return (-1);
+	}
+
+	// Allocates memory to store an array of the current maximum number of 
+	// blocks for each tag (GLOBAL VARIABLE)
+	maxBlockNumAllowed = (int *) calloc(maxlines, sizeof(int));
+
+	if (!maxBlockNumAllowed) {
+		logMessage(LOG_ERROR_LEVEL, "Memory allocation failed. Bye bye!");
+		return (-1);
+	}
+
+	// Allocates memory to store an array of allocation table entry addresses (GLOBAL VARIABLE).
+	// One extra element is added so the last entry is always designated to be NULL.
+	raidtable = (tableinfo **) calloc((MAX_TAGLINE_BLOCK_NUMBER * maxlines) + 1, sizeof(tableinfo));
+	
+	if (!raidtable) {
+		logMessage(LOG_ERROR_LEVEL, "Memory allocation failed. Bye bye!");
+		return (-1);
+	}
+
+	// Allocates memory to the buffer that will be used in the RAID signal method (GLOBAL VARIBLE)
+	failureBuf = malloc(RAID_MAX_XFER * RAID_BLOCK_SIZE);
+
+	if (!failureBuf) {
+		logMessage(LOG_ERROR_LEVEL, "Memory allocation failed. Bye bye!");
+		return (-1);
+	}
+
+	// Formats the disks. First disk number is 0.
+	for (i = 0; i < NUM_DISKS; i++) {
+		response = create_raid_request (RAID_FORMAT, 0, i, 0, 0, 0, NULL);
+
+		// Checks if the RAID command executed successfully
+		extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+		if (arr[RAID_OPCODE_STATUS] == 1) {
+			logMessage(LOG_INFO_LEVEL, "A RAID command failed. Bye bye!");
+			return (-1);
+		}
+	}
+
+	// Initializes the cache
+	init_raid_cache((uint32_t) MAX_BLOCKS_CACHE);
+
+	// Initializes cache statistics
+	hits = 0;
+	misses = 0;
+
+	// Return successfully
+	logMessage(LOG_INFO_LEVEL, "TAGLINE: initialized storage (maxline=%u)", maxlines);
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : tagline_read
+// Description  : Read a number of blocks from the tagline driver
+//
+// Inputs       : tag - the number of the tagline to read from
+//                bnum - the starting block to read from
+//                blks - the number of blocks to read
+//                buf - memory block to read the blocks into
+// Outputs      : 0 if successful, -1 if failure
+
+int tagline_read(TagLineNumber tag, TagLineBlockNumber bnum, uint8_t blks, char *buf) {
+
+	// Makes sure the blocks being read does not pass the max block number
+	if (bnum + blks > maxBlockNumAllowed[tag]){
+		return (-1);
+	}
+
+	// Declares local variables
+	tableinfo *temp;
+	RAIDOpCode response;
+	int blksRead = 0, *cacheTemp, reading;
+	int arr[RAID_OPCODE_MAXVAL] = {0};
+
+	// Reads tagline info by sets of contiguous blocks in RAID.
+	while (blksRead < blks) {
+		// Obtains the address of the tag entry
+		if ((temp = getTagEntry(tag, bnum + blksRead)) == NULL) {
+			logMessage(LOG_ERROR_LEVEL, "Tag entry does not exist. Bye bye!");
+			return (-1);
+		}
+
+		// Determines the amount of contiguous blocks needed to read
+		if (temp->contiguous > blks - blksRead) reading = blks - blksRead; else reading = temp->contiguous;
+
+		// Reads from the cache if applicable
+		if ((cacheTemp = (int *) get_raid_cache(temp->disk, temp->blockID)) != NULL) {
+			hits++;
+			memcpy(&buf[blksRead * TAGLINE_BLOCK_SIZE], cacheTemp, reading * TAGLINE_BLOCK_SIZE);
+		}
+
+		// Reads from RAID otherwise and inserts data into cache
+		else {
+			misses++;
+			response = create_raid_request
+				(RAID_READ, reading, temp->disk, 0, 0, 
+				temp->blockID, &buf[blksRead * TAGLINE_BLOCK_SIZE]);
+			put_raid_cache(temp->disk, temp->blockID, buf);
+
+			// Checks if the RAID command executed successfully
+			extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+			if (arr[RAID_OPCODE_STATUS] == 1) {
+				logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");
+				return (-1);
+			}
+		}
+
+		// Increases the number of block read
+		blksRead += reading;
+	}
+
+	// Return successfully
+	logMessage(LOG_INFO_LEVEL, "TAGLINE : read %u blocks from tagline %u, starting block %u.",
+			blks, tag, bnum);
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : tagline_write
+// Description  : Write a number of blocks from the tagline driver
+//
+// Inputs       : tag - the number of the tagline to write from
+//                bnum - the starting block to write from
+//                blks - the number of blocks to write
+//                buf - the place to write the blocks into
+// Outputs      : 0 if successful, -1 if failure
+
+int tagline_write(TagLineNumber tag, TagLineBlockNumber bnum, uint8_t blks, char *buf) {
+
+	// Makes sure the starting block number does not exceed the max block number
+	if (bnum > maxBlockNumAllowed[tag]) {
+		return (-1);
+	}
+
+	// Declares local variables
+	int blksRead = 0, maxBlockNum, result, overwriteNum;
+	RAIDOpCode response, responsetwo;
+	tableinfo *temp;
+	int arr[RAID_OPCODE_MAXVAL] = {0};
+	int arrtwo[RAID_OPCODE_MAXVAL] = {0};
+
+	// Extracts the max block number that can be written to the tag
+	maxBlockNum = maxBlockNumAllowed[tag];
+
+	// Determines the amount of blocks to overwrite, assuming that an overwrite will occur
+	overwriteNum = blks;
+	if (bnum + blks > maxBlockNum) {
+		overwriteNum = maxBlockNum - bnum;
+	}
+
+	// Overwrite existing tagline blocks and insert remaining new blocks
+	// if a given tag entry already exists.
+	if (getTagEntry(tag, bnum) != NULL) {
+		// Overwrite blocks by sets of contiguous blocks in RAID
+		while (blksRead < overwriteNum) {
+			// Overwrite exisiting blocks by contiguous sets
+			temp = (tableinfo *) getTagEntry(tag, bnum + blksRead);
+			response = create_raid_request
+				(RAID_WRITE, temp->contiguous, temp->disk, 0, 0, 
+				temp->blockID, &buf[blksRead * TAGLINE_BLOCK_SIZE]);
+			responsetwo = create_raid_request
+				(RAID_WRITE, temp->contiguous, temp->diskCopy, 0, 0, 
+				temp->blockIDCopy, &buf[blksRead * TAGLINE_BLOCK_SIZE]);
+
+			// Checks if RAID disk and block exists in cache
+			if (get_raid_cache(temp->disk, temp->blockID) == NULL) misses++; else hits++;
+			put_raid_cache(temp->disk, temp->blockID, &buf[blksRead * TAGLINE_BLOCK_SIZE]);
+
+			if (get_raid_cache(temp->diskCopy, temp->blockIDCopy) == NULL) misses++; else hits++;
+			put_raid_cache(temp->diskCopy, temp->blockIDCopy, &buf[blksRead * TAGLINE_BLOCK_SIZE]);
+
+			// Checks if the RAID commands executed successfully
+			extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+			extract_raid_response(responsetwo, arrtwo, RAID_OPCODE_MAXVAL);
+			if (arr[RAID_OPCODE_STATUS] == 1 || arrtwo[RAID_OPCODE_STATUS] == 1) {
+				logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");
+				return (-1);
+			}
+
+			// Increases the amount of blocks overwritten
+			blksRead += temp->contiguous;
+		}
+
+		// Inserts new blocks if necessary
+		if (blksRead < blks) {
+			result = insertEntry(tag, maxBlockNum, bnum + blks - maxBlockNum
+					, &buf[blksRead * TAGLINE_BLOCK_SIZE]);
+		}
+	}
+
+	// Inserts into a new set of contiguous blocks otherwise
+	else {
+		result = insertEntry(tag, bnum, blks, buf);
+	}
+
+	// Checks if the insertEntry method succeeded
+	if (result == -1) {
+		logMessage(LOG_ERROR_LEVEL, "Insert has failed. Bye bye!");
+		return (-1);
+	}
+
+	// Increases the max block number if necessary
+	if (bnum + blks > maxBlockNum) {
+		maxBlockNumAllowed[tag] = bnum + blks;
+	}
+
+	// Return successfully
+	logMessage(LOG_INFO_LEVEL, "TAGLINE : wrote %u blocks to tagline %u, starting block %u.",
+			blks, tag, bnum);
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : tagline_close
+// Description  : Close the tagline interface
+//
+// Inputs       : none
+// Outputs      : 0 if successful, -1 if failure
+
+int tagline_close(void) {
+
+	// Declares local variables
+	RAIDOpCode response;
+	int arr[RAID_OPCODE_MAXVAL] = {0};
+	int i;
+
+	// Frees the allocated pointers
+	free(failureBuf);
+	failureBuf = NULL;
+
+	free(maxBlockNumAllowed);
+	maxBlockNumAllowed = NULL;
+
+	i = 0;
+	while (raidtable[i] != NULL) {
+		free(raidtable[i]);
+		raidtable[i] = NULL;
+		i++;
+	}
+
+	free(raidtable);
+	raidtable = NULL;
+
+	// Prints out cache statistics
+	logMessage(LOG_OUTPUT_LEVEL, "--- Cache statistics ---");
+	logMessage(LOG_OUTPUT_LEVEL, "Cache gets: %d", hits + misses);
+	logMessage(LOG_OUTPUT_LEVEL, "Cache inserts: %d", misses);
+	logMessage(LOG_OUTPUT_LEVEL, "Cache hits: %d", hits);
+	logMessage(LOG_OUTPUT_LEVEL, "Cache misses: %d", misses);
+	logMessage(LOG_OUTPUT_LEVEL, "Cache hit rate: %5.2f%%", (double) hits / (hits + misses) * 100);
+
+	// Close the RAID cache
+	close_raid_cache();
+
+	// Closes the RAID disks
+	response = create_raid_request(RAID_CLOSE, 0, 0, 0, 0, 0, NULL);
+	
+	// Checks if the RAID command executed successfully
+	extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+	if (arr[RAID_OPCODE_STATUS] == 1) {
+		logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");
+		return (-1);
+	}
+
+	// Return successfully
+	logMessage(LOG_INFO_LEVEL, "TAGLINE storage device: closing completed.");
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : raid_disk_signal
+// Description  : A disk has failed which needs to be recovered
+//
+// Inputs       : none
+// Outputs      : 0 success, 1 is failure
+
+int raid_disk_signal(void) {
+	
+	// Declares local variables
+	int i = 0, *cacheTemp; 
+	RAIDDiskID diskFailed;
+	RAIDOpCode response, responsetwo;
+	tableinfo *temp;
+	int arr[RAID_OPCODE_MAXVAL] = {0};
+	int arrtwo[RAID_OPCODE_MAXVAL] = {0};
+
+	// Determines which disk has failed
+	do {
+		response = create_raid_request(RAID_STATUS, 0, i, 0, 0, 0, NULL);
+
+		// Extracts the RAID opcode and stores it in an array
+		extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+
+		// Checks if the RAID command executed successfully
+		if (arr[RAID_OPCODE_STATUS] == 1) {
+			logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");
+			return (1);
+		}
+
+		i++;
+	} while (arr[RAID_OPCODE_BLOCKID] != RAID_DISK_FAILED);
+
+	// Sets the number of the failed disk
+	diskFailed = i - 1;
+
+	// Formats the failed disk
+	response = create_raid_request(RAID_FORMAT, 0, diskFailed, 0, 0, 0, NULL);
+
+	// Checks if the RAID command executed successfully
+	extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+	if (arr[RAID_OPCODE_STATUS] == 1) {
+		logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");
+		return (1);
+	}
+
+	// Recovers blocks by searching the allocation table for entries containing the
+	// failed disk
+	i = 0;
+	while (raidtable[i] != NULL) {
+		temp = (tableinfo *) raidtable[i];
+		if (temp->disk == diskFailed) {
+			// Reads from the cache if applicable
+			if ((cacheTemp = (int *) get_raid_cache(temp->disk, temp->blockID)) != NULL) {
+				hits++;
+				memcpy(failureBuf, cacheTemp, temp->contiguous * TAGLINE_BLOCK_SIZE);
+			}
+			
+			// Reads from RAID otherwise and inserts data into cache
+			else {
+				misses++;
+				response = create_raid_request(RAID_READ, temp->contiguous, 
+					temp->diskCopy, 0, 0, temp->blockIDCopy, failureBuf);
+				put_raid_cache(temp->diskCopy, temp->blockIDCopy, failureBuf);
+			}
+			responsetwo = create_raid_request(RAID_WRITE, temp->contiguous, 
+					temp->disk, 0, 0, temp->blockID, failureBuf);
+		}
+		else if (temp->diskCopy == diskFailed) {
+			// Reads from the cache if applicable
+			if ((cacheTemp = (int *) get_raid_cache(temp->diskCopy, temp->blockIDCopy)) != NULL) {
+				hits++;
+				memcpy(failureBuf, cacheTemp, temp->contiguous * TAGLINE_BLOCK_SIZE);
+			}
+			// Reads from RAID otherwise and inserts data into cache
+			else {
+				misses++;
+				response = create_raid_request(RAID_READ, temp->contiguous,
+					temp->disk, 0, 0, temp->blockID, failureBuf);
+				put_raid_cache(temp->diskCopy, temp->blockIDCopy, failureBuf);
+			}
+			responsetwo = create_raid_request(RAID_WRITE, temp->contiguous,
+				temp->diskCopy, 0, 0, temp->blockIDCopy, failureBuf);
+		}
+
+		// Checks if the RAID commands executed successfully if an allocation table entry is found
+		if (temp->disk == diskFailed || temp->diskCopy == diskFailed) {
+			extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+			extract_raid_response(responsetwo, arrtwo, RAID_OPCODE_MAXVAL);
+
+			if (arr[RAID_OPCODE_STATUS] == 1 || arrtwo[RAID_OPCODE_STATUS] == 1) {
+				logMessage(LOG_ERROR_LEVEL, "A RAID command failed. Bye bye!");
+				return (1);
+			}
+		}
+		i++;
+	}
+
+	// Return successfully
+	logMessage(LOG_INFO_LEVEL, "TAGLINE processed raid disk signal successfully.");
+
+	return(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : create_raid_request
+// Description  : Constructs a request structure and makes a request.
+//		  
+//
+// Inputs       : requestType - value that indicates the request type
+//		  numBlocks - the number of blocks or number of tracks for RAID_INIT
+//		  diskNum - the disk number
+//		  unused - set to 0 for now
+//		  status - 0 for success or 1 for failure
+//		  blockID - the block ID
+//		  buf - buffer required by the bus request
+//		  
+// Outputs      : the response opcode
+
+RAIDOpCode create_raid_request (uint64_t requestType, uint64_t numBlocks, uint64_t diskNum,
+	uint64_t unused, uint64_t status, uint64_t blockID, void *buf){
+	
+	// Constructs the request structure
+	requestType = (requestType & STRCTURE_REQ) << (64 - NUMBER_REQ_BITS);
+	numBlocks = (numBlocks & STRUCTURE_BLOCK_NUM) << (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS);
+	diskNum = (diskNum & STRUCTURE_DISK_ID) << (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS - NUMBER_DISK_ID_BITS);
+	unused = (unused & STRUCTURE_UNUSED) << (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS - NUMBER_DISK_ID_BITS
+		- NUMBER_UNUSED_BITS);
+	status = (status & STRUCTURE_STATUS) << (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS - NUMBER_DISK_ID_BITS
+		- NUMBER_UNUSED_BITS - NUMBER_STATUS_BIT);
+	blockID = (blockID & STRUCTURE_BLOCK_ID);
+	
+	// Creates the opcode and makes a request
+	RAIDOpCode request = requestType|numBlocks|diskNum|unused|status|blockID;
+	return client_raid_bus_request(request, buf);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : extract_raid_response
+// Description  : Extracts an opcode and stores the data in an array. 
+//
+// Inputs       : resp -  the response opcode
+//		  arr - the array that will hold the values
+//		  arrLen - the length of the array (must be at least 6)
+
+void extract_raid_response (RAIDOpCode resp, int arr[], int arrLen){
+
+	// Ensures that the length of the array is long enough
+	if (arrLen < 6) {
+		return;
+	}
+
+	// Extracts each field from the opcode and stores them in the array
+	arr[RAID_OPCODE_REQTYPE] = (resp >> (64 - NUMBER_REQ_BITS)) & STRCTURE_REQ;
+	arr[RAID_OPCODE_BLOCKS] = (resp >> (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS)) & STRUCTURE_BLOCK_NUM;
+	arr[RAID_OPCODE_DISKID] = (resp >> (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS - NUMBER_DISK_ID_BITS)) &
+		STRUCTURE_DISK_ID;
+	arr[RAID_OPCODE_UNUSED] = (resp >> (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS - NUMBER_DISK_ID_BITS
+		- NUMBER_UNUSED_BITS)) & STRUCTURE_UNUSED;
+	arr[RAID_OPCODE_STATUS] = (resp >> (64 - NUMBER_REQ_BITS - NUMBER_BLOCK_NUM_BITS - NUMBER_DISK_ID_BITS
+		- NUMBER_UNUSED_BITS - NUMBER_STATUS_BIT)) & STRUCTURE_STATUS;
+	arr[RAID_OPCODE_BLOCKID] = (resp) & STRUCTURE_BLOCK_ID;
+
+	return;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : insertEntry
+// Description  : Creates a new entry with the given tagline info and opcodes, provided 
+// 		  that the tag number and block number combination does not already
+// 		  exist
+// Inputs       : tagNum - the tag number
+// 		  tagBlockNum - the starting block number
+// 		  blks - the number of blocks
+// 		  buf - the buffer
+// Outputs	: 0 for success, or -1 for failure
+
+int insertEntry (TagLineNumber tagNum, TagLineBlockNumber tagBlockNum, uint8_t blks, char* buf) {
+
+	// Declares variables
+	RAIDDiskID newDisk, backupDisk;
+	RAIDBlockID newRAIDBlock, backupRAIDBlock;
+	RAIDOpCode response, responsetwo;
+	tableinfo *temp;
+	int entry, i;
+	int arr[RAID_OPCODE_MAXVAL] = {0};
+	int arrtwo[RAID_OPCODE_MAXVAL] = {0};
+	flag invalid;
+
+	// Ensures that the tag number and block number combination does not already exist
+	if (getTagEntry(tagNum, tagBlockNum) != NULL) {
+		return (-1);
+	}
+
+	// Selects a contiguous range of blocks that are not already occupuied
+	// for the primary copy
+	newDisk = rand() % NUM_DISKS;
+	do {
+		invalid = FALSE;
+		newRAIDBlock = rand() % (MAX_TRACKS * RAID_TRACK_BLOCKS);
+
+		// Ensures that the range of blocks do not pass
+		// the end of the RAID disk
+		if (newRAIDBlock + blks >= MAX_TRACKS * RAID_TRACK_BLOCKS) {
+			invalid = TRUE;
+			continue;
+		}
+
+		for (i = 0; i < blks; i++) {
+			if (getRAIDEntry(newDisk, newRAIDBlock + i) != NULL) {
+				invalid = TRUE;
+				break;
+			}
+		}
+	} while (invalid == TRUE);
+
+	// Writes into primary RAID designation and cache
+	response = create_raid_request
+		(RAID_WRITE, blks, newDisk, 0, 0, newRAIDBlock, buf);
+	if (get_raid_cache(newDisk, newRAIDBlock) == NULL) misses++; else hits++;
+	put_raid_cache(newDisk, newRAIDBlock, buf);
+
+	// Selects a contiguous range of blocks that are not already occupuied
+	// for the backup copy
+	do {
+		invalid = FALSE;
+		backupDisk = rand() % NUM_DISKS;
+		backupRAIDBlock = rand() % (MAX_TRACKS * RAID_TRACK_BLOCKS);
+
+		// Ensures that the range of blocks are not in the same disk and they do not pass
+		// the end of the RAID disk
+		if (backupDisk == newDisk || backupRAIDBlock + blks >= MAX_TRACKS * RAID_TRACK_BLOCKS) {
+			invalid = TRUE;
+			continue;
+		}
+
+		for (i = 0; i < blks; i++) {
+			if (getRAIDEntry(backupDisk, backupRAIDBlock + i) != NULL) {
+				invalid = TRUE;
+				break;
+			}
+		}
+	} while (invalid == TRUE);
+		
+	// Writes into backup RAID designation and cache
+	responsetwo = create_raid_request
+		(RAID_WRITE, blks, backupDisk, 0, 0, backupRAIDBlock, buf);
+	if (get_raid_cache(backupDisk, backupRAIDBlock) == NULL) misses++; else hits++;
+	put_raid_cache(backupDisk, backupRAIDBlock, buf);
+
+	// Checks if the RAID commands executed successfully 
+	extract_raid_response(response, arr, RAID_OPCODE_MAXVAL);
+	extract_raid_response(responsetwo, arrtwo, RAID_OPCODE_MAXVAL);
+
+	if (arr[RAID_OPCODE_STATUS] == 1 || arrtwo[RAID_OPCODE_STATUS] == 1) {
+		logMessage(LOG_ERROR_LEVEL, "A RAID command failed.");
+		return (-1);
+	}
+	
+	for (i = 0; i < blks; i++) {
+		// Allocates memory for a new entry
+		temp = (tableinfo *) calloc(1, sizeof(tableinfo));
+
+		if (!temp) {
+			logMessage(LOG_ERROR_LEVEL, "Memory allocation failed.");
+			return (-1);
+		}
+
+		// Enters data into the entry
+		temp->tagline = tagNum;
+		temp->taglineBlock = tagBlockNum + i;
+		temp->contiguous = (int) blks;
+		temp->disk = arr[RAID_OPCODE_DISKID];
+		temp->blockID = arr[RAID_OPCODE_BLOCKID] + i;
+		temp->diskCopy = arrtwo[RAID_OPCODE_DISKID]; 
+		temp->blockIDCopy = arrtwo[RAID_OPCODE_BLOCKID] + i;
+
+		// Finds the offset for the new entry
+		entry = 0;
+		while (raidtable[entry] != NULL) entry++;
+
+		// Adds the entry to the allocation table
+		raidtable[entry] = temp;
+	}
+
+	return 0;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : getTagEntry
+// Description  : Extracts the address of the entry with the tagline number and 
+// 		  tagline block number combination in the table, if it exists 
+//
+// Inputs       : tagNum - the tagline number to examine
+//		  tagBlockNum - the tagline block number to examine 
+// Outputs	: the pointer to the entry, or NULL if it does not exist
+
+void* getTagEntry (TagLineNumber tagNum, TagLineBlockNumber tagBlockNum){
+
+	// Declares local variables
+	int entry = 0;
+	tableinfo *temp; 
+		
+	// Searches the allocation table while the current entry exists
+	// Returns the address of the entry with matching tag number
+	// and tag block number if entry is found
+	while (raidtable[entry] != NULL) {
+		temp = (tableinfo *) raidtable[entry];
+		if (temp->tagline == tagNum && temp->taglineBlock == tagBlockNum) return temp;
+		entry++;
+	}
+
+	// Returns NULL if entry is not found
+	return NULL;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Function     : getRAIDEntry
+// Description  : Extracts the address of the entry with the RAID disk number and block
+// 		  ID combination, if it exists
+//
+// Inputs       : diskNum - the tagline number to examine
+//		  blockIDNum - the tagline block number to examine 
+// Outputs	: the pointer to the entry, or NULL if it does not exist
+
+void* getRAIDEntry (RAIDDiskID diskNum, RAIDBlockID blockIDNum){
+
+	// Declares local variables
+	uint64_t entry = 0;
+	tableinfo *temp; 
+
+	// Searches the allocation table for a RAID disk number and block ID combination
+	while (raidtable[entry] != NULL) {
+		temp = (tableinfo *) raidtable[entry];
+		if (temp->disk == diskNum && temp->blockID == blockIDNum) return temp;
+		if (temp->diskCopy == diskNum && temp->blockIDCopy == blockIDNum) return temp;
+		entry++;
+	}
+
+
+	// Returns NULL
+	return NULL;
+}
